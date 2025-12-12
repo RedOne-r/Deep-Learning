@@ -1,10 +1,8 @@
 from __future__ import annotations
 
-import os
 import pickle
 from typing import Any, Dict, List
 
-# --- Dépendances (tokenizers HF) ---
 try:
     from tokenizers import ByteLevelBPETokenizer
     from tokenizers.processors import TemplateProcessing
@@ -20,49 +18,51 @@ except ImportError as e:
 # Configuration
 # -----------------------------
 INPUT_PKL = "dataset_dsl_manim.pkl"
-OUTPUT_PKL = "dataset_dsl_manim_tokenized.pkl"
 
-TOKENIZER_DIR = "tokenizers"
-DSL_TOKENIZER_JSON = os.path.join(TOKENIZER_DIR, "dsl_tokenizer.json")
-CODE_TOKENIZER_JSON = os.path.join(TOKENIZER_DIR, "code_tokenizer.json")
+MAX_LEN = 200  # padding/truncation fixés à 200
 
-# Token spéciaux
+OUTPUT_PKL = f"dataset_dsl_manim_tokenized_pad{MAX_LEN}.pkl"
+DSL_TOKENIZER_JSON = f"dsl_tokenizer_pad{MAX_LEN}.json"
+CODE_TOKENIZER_JSON = f"code_tokenizer_pad{MAX_LEN}.json"
+
+# Tokens spéciaux
 PAD = "<pad>"
 UNK = "<unk>"
 BOS = "<bos>"
 EOS = "<eos>"
 SPECIAL_TOKENS = [PAD, UNK, BOS, EOS]
 
-# Tailles vocab (à ajuster si besoin)
+# Vocabs (ajustables)
 DSL_VOCAB_SIZE = 2000
 CODE_VOCAB_SIZE = 8000
-
-# Fréquence minimale pour garder un token
 MIN_FREQUENCY = 2
 
 
 # -----------------------------
-# Utilitaires
+# Load dataset
 # -----------------------------
-def _load_pairs(path: str) -> List[Dict[str, str]]:
+def load_pairs(path: str) -> List[Dict[str, str]]:
     with open(path, "rb") as f:
         data = pickle.load(f)
+
     if not isinstance(data, list):
-        raise ValueError("Le fichier pickle ne contient pas une liste.")
-    # validation légère
-    for i, item in enumerate(data[:5]):
-        if not isinstance(item, dict) or "dsl" not in item or "code" not in item:
-            raise ValueError(f"Entrée {i} invalide: attendu dict avec clés 'dsl' et 'code'.")
+        raise ValueError("Le pickle doit contenir une liste.")
+
+    if data:
+        ex = data[0]
+        if not isinstance(ex, dict) or "dsl" not in ex or "code" not in ex:
+            raise ValueError("Chaque élément doit être un dict avec clés 'dsl' et 'code'.")
+
     return data
 
 
-def _train_byte_bpe(texts: List[str], vocab_size: int) -> ByteLevelBPETokenizer:
-    """
-    Entraîne un Byte-Level BPE tokenizer (style GPT-2) sur une liste de strings.
-    """
-    tokenizer = ByteLevelBPETokenizer()
+# -----------------------------
+# Train + configure tokenizer
+# -----------------------------
+def train_byte_bpe(texts: List[str], vocab_size: int, max_len: int) -> ByteLevelBPETokenizer:
+    tok = ByteLevelBPETokenizer()
 
-    tokenizer.train_from_iterator(
+    tok.train_from_iterator(
         texts,
         vocab_size=vocab_size,
         min_frequency=MIN_FREQUENCY,
@@ -70,51 +70,54 @@ def _train_byte_bpe(texts: List[str], vocab_size: int) -> ByteLevelBPETokenizer:
         show_progress=True,
     )
 
-    # Récupérer les ids des tokens spéciaux
-    bos_id = tokenizer.token_to_id(BOS)
-    eos_id = tokenizer.token_to_id(EOS)
-    if bos_id is None or eos_id is None:
-        raise RuntimeError("Impossible de récupérer les ids de <bos>/<eos> après entraînement.")
+    # ids tokens spéciaux
+    pad_id = tok.token_to_id(PAD)
+    bos_id = tok.token_to_id(BOS)
+    eos_id = tok.token_to_id(EOS)
+    if pad_id is None or bos_id is None or eos_id is None:
+        raise RuntimeError("Impossible de récupérer pad/bos/eos ids après entraînement.")
 
-    # Ajoute automatiquement BOS/EOS à chaque séquence encodée
-    tokenizer._tokenizer.post_processor = TemplateProcessing(
+    # Ajout BOS/EOS automatique
+    tok._tokenizer.post_processor = TemplateProcessing(
         single=f"{BOS} $A {EOS}",
         pair=f"{BOS} $A {EOS} $B:1 {EOS}:1",
         special_tokens=[(BOS, bos_id), (EOS, eos_id)],
     )
 
-    return tokenizer
+    # Truncation + padding à longueur fixe
+    tok.enable_truncation(max_length=max_len)
+    tok.enable_padding(length=max_len, pad_id=pad_id, pad_token=PAD)
+
+    return tok
 
 
-def _encode_dataset(
+# -----------------------------
+# Encode dataset
+# -----------------------------
+def encode_dataset(
     pairs: List[Dict[str, str]],
     dsl_tok: ByteLevelBPETokenizer,
     code_tok: ByteLevelBPETokenizer,
 ) -> List[Dict[str, Any]]:
-    """
-    Transforme [{"dsl":..., "code":...}, ...] en
-    [{"dsl_ids":[...], "code_ids":[...]}, ...]
-    """
     out: List[Dict[str, Any]] = []
     total = len(pairs)
 
     for i, p in enumerate(pairs):
-        dsl = p["dsl"]
-        code = p["code"]
+        dsl_enc = dsl_tok.encode(p["dsl"])
+        code_enc = code_tok.encode(p["code"])
 
-        dsl_ids = dsl_tok.encode(dsl).ids
-        code_ids = code_tok.encode(code).ids
-
+        # Grâce au padding/truncation, tout est longueur MAX_LEN
         out.append(
             {
-                "dsl_ids": dsl_ids,
-                "code_ids": code_ids,
+                "dsl_ids": dsl_enc.ids,
+                "dsl_mask": dsl_enc.attention_mask,   # 1 = token réel, 0 = pad
+                "code_ids": code_enc.ids,
+                "code_mask": code_enc.attention_mask,
             }
         )
 
-        # petit log toutes les 1000 lignes
         if (i + 1) % 1000 == 0 or (i + 1) == total:
-            print(f"Tokenisation: {i+1}/{total}")
+            print(f"Encodage: {i+1}/{total}")
 
     return out
 
@@ -123,43 +126,35 @@ def _encode_dataset(
 # Main
 # -----------------------------
 def main() -> None:
-    if not os.path.exists(INPUT_PKL):
-        raise SystemExit(
-            f"Fichier introuvable: {INPUT_PKL}\n"
-            "Assure-toi d'être à la racine du projet et d'avoir généré le dataset .pkl."
-        )
-
     print(f"Chargement: {INPUT_PKL}")
-    pairs = _load_pairs(INPUT_PKL)
-    print(f"OK: {len(pairs)} paires chargées")
+    pairs = load_pairs(INPUT_PKL)
+    print(f"OK: {len(pairs)} paires")
 
-    # Corpus séparés
     dsl_texts = [p["dsl"] for p in pairs]
     code_texts = [p["code"] for p in pairs]
 
-    os.makedirs(TOKENIZER_DIR, exist_ok=True)
-
-    print("\nEntraînement tokenizer DSL (Byte-Level BPE)...")
-    dsl_tok = _train_byte_bpe(dsl_texts, vocab_size=DSL_VOCAB_SIZE)
-    dsl_tok.save(DSL_TOKENIZER_JSON)
+    print("\nEntraînement tokenizer DSL (Byte-level BPE)...")
+    dsl_tok = train_byte_bpe(dsl_texts, vocab_size=DSL_VOCAB_SIZE, max_len=MAX_LEN)
+    dsl_tok._tokenizer.save(DSL_TOKENIZER_JSON)
     print(f"Tokenizer DSL sauvegardé: {DSL_TOKENIZER_JSON}")
 
-    print("\nEntraînement tokenizer CODE (Byte-Level BPE)...")
-    code_tok = _train_byte_bpe(code_texts, vocab_size=CODE_VOCAB_SIZE)
-    code_tok.save(CODE_TOKENIZER_JSON)
+    print("\nEntraînement tokenizer CODE (Byte-level BPE)...")
+    code_tok = train_byte_bpe(code_texts, vocab_size=CODE_VOCAB_SIZE, max_len=MAX_LEN)
+    code_tok._tokenizer.save(CODE_TOKENIZER_JSON)
     print(f"Tokenizer CODE sauvegardé: {CODE_TOKENIZER_JSON}")
 
-    print("\nTokenisation du dataset...")
-    tokenized_pairs = _encode_dataset(pairs, dsl_tok, code_tok)
+    print("\nTokenisation + padding/truncation du dataset...")
+    tokenized = encode_dataset(pairs, dsl_tok, code_tok)
 
     print(f"\nSauvegarde dataset tokenisé: {OUTPUT_PKL}")
     with open(OUTPUT_PKL, "wb") as f:
-        pickle.dump(tokenized_pairs, f, protocol=pickle.HIGHEST_PROTOCOL)
+        pickle.dump(tokenized, f, protocol=pickle.HIGHEST_PROTOCOL)
 
-    print("Terminé ✅")
-    print(f"- Dataset tokenisé: {OUTPUT_PKL}")
-    print(f"- Tokenizer DSL:   {DSL_TOKENIZER_JSON}")
-    print(f"- Tokenizer CODE:  {CODE_TOKENIZER_JSON}")
+    print("\nTerminé ✅")
+    print("Fichiers générés :")
+    print("-", OUTPUT_PKL)
+    print("-", DSL_TOKENIZER_JSON)
+    print("-", CODE_TOKENIZER_JSON)
 
 
 if __name__ == "__main__":
