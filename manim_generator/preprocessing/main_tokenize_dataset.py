@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import pickle
-from typing import Any, Dict, List
+from typing import List, Tuple
 
 try:
     from tokenizers import ByteLevelBPETokenizer
@@ -21,7 +21,8 @@ INPUT_PKL = "dataset_dsl_manim.pkl"
 
 MAX_LEN = 200  # padding/truncation fixés à 200
 
-OUTPUT_PKL = f"dataset_dsl_manim_tokenized_pad{MAX_LEN}.pkl"
+# Sorties
+OUTPUT_PKL = f"dataset_dsl_manim_tokenized_pad{MAX_LEN}_tuples.pkl"
 DSL_TOKENIZER_JSON = f"dsl_tokenizer_pad{MAX_LEN}.json"
 CODE_TOKENIZER_JSON = f"code_tokenizer_pad{MAX_LEN}.json"
 
@@ -41,7 +42,7 @@ MIN_FREQUENCY = 2
 # -----------------------------
 # Load dataset
 # -----------------------------
-def load_pairs(path: str) -> List[Dict[str, str]]:
+def load_pairs(path: str) -> List[dict]:
     with open(path, "rb") as f:
         data = pickle.load(f)
 
@@ -92,29 +93,24 @@ def train_byte_bpe(texts: List[str], vocab_size: int, max_len: int) -> ByteLevel
 
 
 # -----------------------------
-# Encode dataset
+# Encode dataset (compact tuples)
 # -----------------------------
-def encode_dataset(
-    pairs: List[Dict[str, str]],
+def encode_dataset_as_tuples(
+    pairs: List[dict],
     dsl_tok: ByteLevelBPETokenizer,
     code_tok: ByteLevelBPETokenizer,
-) -> List[Dict[str, Any]]:
-    out: List[Dict[str, Any]] = []
+) -> List[Tuple[List[int], List[int]]]:
+    """
+    Retourne une liste de couples (dsl_ids, code_ids), chacun de longueur MAX_LEN.
+    """
+    out: List[Tuple[List[int], List[int]]] = []
     total = len(pairs)
 
     for i, p in enumerate(pairs):
-        dsl_enc = dsl_tok.encode(p["dsl"])
-        code_enc = code_tok.encode(p["code"])
+        dsl_ids = dsl_tok.encode(p["dsl"]).ids
+        code_ids = code_tok.encode(p["code"]).ids
 
-        # Grâce au padding/truncation, tout est longueur MAX_LEN
-        out.append(
-            {
-                "dsl_ids": dsl_enc.ids,
-                "dsl_mask": dsl_enc.attention_mask,   # 1 = token réel, 0 = pad
-                "code_ids": code_enc.ids,
-                "code_mask": code_enc.attention_mask,
-            }
-        )
+        out.append((dsl_ids, code_ids))
 
         if (i + 1) % 1000 == 0 or (i + 1) == total:
             print(f"Encodage: {i+1}/{total}")
@@ -143,8 +139,8 @@ def main() -> None:
     code_tok._tokenizer.save(CODE_TOKENIZER_JSON)
     print(f"Tokenizer CODE sauvegardé: {CODE_TOKENIZER_JSON}")
 
-    print("\nTokenisation + padding/truncation du dataset...")
-    tokenized = encode_dataset(pairs, dsl_tok, code_tok)
+    print("\nTokenisation + padding/truncation du dataset (format tuples)...")
+    tokenized = encode_dataset_as_tuples(pairs, dsl_tok, code_tok)
 
     print(f"\nSauvegarde dataset tokenisé: {OUTPUT_PKL}")
     with open(OUTPUT_PKL, "wb") as f:
@@ -159,3 +155,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
